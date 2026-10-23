@@ -1,0 +1,45 @@
+name: Deploy nuojiji relay
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nuojiji-relay-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.NUOJIJI_DEPLOY_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.NUOJIJI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.NUOJIJI_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.NUOJIJI_DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo -n /usr/local/sbin/nuojiji-relay-deploy'
+
+          curl --fail --silent --show-error --max-time 20 \
+            https://api.littlephone.top/health
+          printf '\n'
