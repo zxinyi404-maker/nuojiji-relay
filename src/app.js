@@ -171,6 +171,15 @@ export function createApp() {
                     const subs = await sub.list(inboxId);
                     if (!subs.length) return;
                     const title = meta?.charName || '糯叽机';
+                    let avatarUrl = meta?.avatarUrl || null;
+                    if (!avatarUrl && item.userId != null && item.charId != null) {
+                        try {
+                            const { proactive } = await getStores(c.env);
+                            avatarUrl = (await proactive.get(inboxId, String(item.userId), String(item.charId)))?.avatarUrl || null;
+                        } catch (e) {
+                            console.warn('[generate] avatar fallback failed:', e?.message);
+                        }
+                    }
                     // 🔒 通知隐私模式（手机端 meta 带来）：正文换「你有一条新消息」，标题/头像保留。
                     const bodies = meta?.notifPrivacy
                         ? extractPushBodies(item.content).map(() => '你有一条新消息')
@@ -187,7 +196,7 @@ export function createApp() {
                         const payload = {
                             title, body, charId: item.charId, userId: item.userId, kind: 'relay-outbox',
                             // 🖼️ iOS 通知扩展：头像 URL + 发信人 + 会话 id（meta 随手机端 submitGeneration 传来）
-                            avatarUrl: meta?.avatarUrl || null,
+                            avatarUrl,
                             senderName: title,
                             conversationId: `${item.userId}_${item.charId}`,
                             mutableContent: true,
