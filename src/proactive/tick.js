@@ -13,6 +13,7 @@ import { buildMemoryContext } from './mcpContext.js';
 import { runProactiveToolLoop } from './proactiveToolPrefetch.js';
 import { createKvStore } from '../store/kvStore.js';
 import { readTickMinutes, DEFAULT_TICK_MINUTES } from './tickConfig.js';
+import { mirrorProactiveToWechat } from '../wechat/routes.js';
 
 // 把滑窗消息渲染成转录文本（喂进 promptTemplate 的 {{RECENT_MESSAGES}}）
 // 🧭 誰 / 何時：用真名（角色標 (you)）+ 時間章（關閉時間感知不帶；自定義時間帶劇情時間）。
@@ -30,6 +31,17 @@ export function renderTranscript(recentMessages, timeSpec = null) {
         const stamp = messageStamp(m, timeSpec);
         return `${stamp}${who}: ${text}`;
     }).join('\n');
+}
+
+// 滑窗里最新一条带时间戳的消息（ms）。后端自己追加的气泡没有时间戳，不计入。
+export function windowLatestAt(recentMessages) {
+    let latest = 0;
+    for (const m of (Array.isArray(recentMessages) ? recentMessages : [])) {
+        const raw = m?.timestamp;
+        const ts = typeof raw === 'number' ? raw : (raw ? Date.parse(String(raw)) : 0);
+        if (Number.isFinite(ts) && ts > latest) latest = ts;
+    }
+    return latest;
 }
 
 // 占位替换：后端唯一接触 prompt 的地方，只做字符串替换，无任何话术。
@@ -153,6 +165,8 @@ export async function runProactiveTick(env) {
                     interval: rec.interval, intervalUnit: rec.intervalUnit, probability: rec.probability,
                     // 从未触发过时的基线（防「一注册就开火」）
                     enabledAt: rec.proactiveEnabledAt || rec.updatedAt || 0,
+                    // 最后一条对话时间：正在聊天时不按计时开火（见 shouldFireInterval）
+                    lastInteractionAt: rec.lastInteractionAt || 0,
                     // 安静时段（与 impulse 档同一份 quietHours；小时按用户/角色时区算，绝不用服务器时区）
                     quietHours: rec.quietHours || rec.proactiveProfile?.quietHours || null,
                     hour: resolveLocalHour({
@@ -278,8 +292,14 @@ export async function runProactiveTick(env) {
                 charId: rec.charId, userId: rec.userId,
                 roundId: requestId, content, reasoning: reasoning || null, error, createdAt: nowMs(),
                 proactive: true,
+                // 生成时滑窗里最新一条消息的时间：手机排水时若本地已有比这更新的对话
+                //（滑窗同步节流没赶上），说明这条是拿旧上下文写的，会和前台回复重复 → 手机端丢弃。
+                basisAt: windowLatestAt(rec.recentMessages) || null,
             };
             await outbox.put(rec.inboxId, item);
+
+            // 💬 连了微信且开了「主动消息发到微信」→ 同一条也发进微信（手机端照常经 outbox 落库，不重复）
+            await mirrorProactiveToWechat(env, { inboxId: rec.inboxId, userId: rec.userId, charId: rec.charId, content });
 
             // 🔑 把 char 自己刚发的消息追加进后端滑窗，否则 user 一直不回复时，下次 tick 用的
             //    还是同一份旧上下文 → AI 看不到自己发过什么 → 反复说类似的话 = 重复消息。
