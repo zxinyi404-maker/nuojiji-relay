@@ -33,7 +33,7 @@ export async function sendApns(env, subscription, payload) {
     const token = subscription?.token || subscription?.sub?.token;
     if (!token) return { ok: false, gone: true, reason: 'no-device-token' };
     try {
-        const options = {
+        const res = await fetch(`${cfg.url}/push`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'authorization': `Bearer ${cfg.secret}` },
             body: JSON.stringify({
@@ -46,18 +46,12 @@ export async function sendApns(env, subscription, payload) {
                 conversationId: payload.conversationId || null,
                 mutableContent: payload.mutableContent !== false,
             }),
-        };
-        const isNode = !env?.OUTBOX && typeof process !== 'undefined' && process.versions?.node;
-        const res = isNode && cfg.url.startsWith('https://')
-            ? await (await import('./nodeApnsTransport' + '.js')).postApns(`${cfg.url}/push`, options)
-            : await fetch(`${cfg.url}/push`, options);
+        });
         if (res.status === 200) return { ok: true, gone: false };
         if (res.status === 410) return { ok: false, gone: true, reason: 'token gone (relay)' };
         const txt = await res.text().catch(() => '');
-        console.warn('[apns] relay returned HTTP', res.status);
         return { ok: false, gone: false, reason: `apns-relay HTTP ${res.status}: ${txt.slice(0, 150)}` };
     } catch (e) {
-        console.warn('[apns] network failure:', e?.code || e?.name || 'unknown');
         return { ok: false, gone: false, reason: e?.message || String(e) };
     }
 }
