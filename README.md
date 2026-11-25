@@ -163,7 +163,7 @@ docker run -d -p 8787:8787 \
 |------|------|------|
 | GET | `/health` | 健康检查（设置页测连接），无需鉴权 |
 | POST | `/generate` | 提交生成，202 立即返回；重复 requestId → 409 |
-| GET | `/outbox?inboxId=&since=&scan=` | 拉取已生成结果（scan=1 额外做 KV 前缀扫描兜底，scan=0 只读索引） |
+| GET | `/outbox?inboxId=&since=&scan=` | 拉取尚未确认且未过期的结果；兼容接收 since，但不按其过滤未确认结果。scan=1 额外做 KV 前缀扫描兜底，scan=0 只读索引 |
 | POST | `/ack` | `{inboxId, ids}` 确认删除 |
 | GET | `/api/push/vapid-key` | 取 VAPID 公钥 |
 | POST | `/api/push/subscribe` | 注册推送订阅 |

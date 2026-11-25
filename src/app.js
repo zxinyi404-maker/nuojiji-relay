@@ -286,14 +286,14 @@ export function createApp() {
 
     app.get('/outbox', async (c) => {
         const inboxId = c.req.query('inboxId');
-        const since = Number(c.req.query('since') || 0);
         if (!inboxId) return c.json({ error: 'inboxId required' }, 400);
         const { outbox } = await getStores(c.env);
         // scan=1 → 额外做 KV 前缀扫描兜底（只在手机启动/回前台时带）；scan=0 → 只走索引，不吃 list 额度；
         // 不带（旧版手机）→ store 内部节流。
         const scanQ = c.req.query('scan');
         const scan = scanQ === '1' ? true : scanQ === '0' ? false : undefined;
-        const items = await outbox.list(inboxId, since, { scan });
+        const items = await outbox.list(inboxId, 0, { scan });
+        c.header('Cache-Control', 'no-store');
         return c.json({ items, now: nowMs() });
     });
 
