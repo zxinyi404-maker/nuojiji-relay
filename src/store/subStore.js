@@ -10,7 +10,17 @@ export async function createSubStore(env) {
     if (env && env.OUTBOX && typeof env.OUTBOX.put === 'function') {
         return new KvSubStore(env.OUTBOX);
     }
-    if (!_nodeSingleton) _nodeSingleton = new MemorySubStore();
+    if (_nodeSingleton) return _nodeSingleton;
+    if (typeof process !== 'undefined' && process.env?.RELAY_STORE === 'sqlite') {
+        try {
+            const mod = await import('./sqliteSubStore' + '.js');
+            _nodeSingleton = new mod.SqliteSubStore(process.env.RELAY_SQLITE_PATH || './outbox.db');
+            return _nodeSingleton;
+        } catch (e) {
+            console.warn('[sub] sqlite unavailable, falling back to memory:', e?.message);
+        }
+    }
+    _nodeSingleton = new MemorySubStore();
     return _nodeSingleton;
 }
 
