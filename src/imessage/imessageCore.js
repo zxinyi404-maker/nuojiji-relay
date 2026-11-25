@@ -12,11 +12,11 @@
 //   pub:<id>   給平台抓的公開音頻（合成語音），一天後清
 //   lastUserAt 最後一條用戶訊息時間
 
-import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now } from '../chatbridge/baseCore.js';
+import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now, replyWaitMs, replyWaitCapMs } from '../chatbridge/baseCore.js';
 import { PROVIDERS, normHandle } from './providers.js';
 import { bytesToB64, b64ToBytes } from '../wechat/ilinkClient.js';
 
-const DEBOUNCE_MS = 4000;
+const DEBOUNCE_MS = 5000;
 const SEEN_CAP = 300;
 const PUB_TTL_MS = 24 * 3600e3;
 
@@ -93,7 +93,7 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
     }
 
     async unbind() {
-        await Promise.all(['acc', 'pending', 'seen'].map((k) => this.s.delete(k)));
+        await Promise.all(['acc', 'pending', 'pendingSince', 'seen'].map((k) => this.s.delete(k)));
         await this.hooks.schedule(null);
         return { json: { ok: true } };
     }
@@ -114,6 +114,12 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
     async getPublic(token, id) {
         const acc = await this.s.get('acc');
         if (!acc || token !== acc.hookToken) return null;
+        // 本機表情：stk_<hash>.<ext>
+        const stk = /^stk_([a-f0-9]+)\.\w+$/.exec(String(id || ''));
+        if (stk) {
+            const s = await this.loadSticker(`stk:${stk[1]}`);
+            return s ? { mime: s.mime, bytes: s.bytes } : null;
+        }
         const rec = await this.s.get(`pub:${id}`);
         if (!rec) return null;
         return { mime: rec.mime, bytes: b64ToBytes(rec.b64) };
@@ -145,7 +151,25 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
         return {
             budget: Infinity,
             sendText: async (text) => { await p.sendText(acc, text); await keepChat(); },
-            sendSticker: async (url) => { await p.sendMedia(acc, url); await keepChat(); },
+            // 生成期間 webhook 又收進來的訊息 → 交給核心併進這輪重新生成（就不必再單獨回一輪）
+            async takeNew() {
+                const raw = (await self.s.get('pending')) || [];
+                if (!raw.length) return [];
+                await self.s.delete('pending');
+                await self.s.delete('pendingSince');
+                return self._toPending(raw, this);
+            },
+            sendSticker: async (url) => {
+                // 本機表情（手機傳上來存在中繼的）→ 給平台一個中繼上的公開網址去抓
+                const local = await self.loadSticker(url);
+                if (local) {
+                    const inboxId = await self.s.get('inbox');
+                    const ext = (local.mime.split('/')[1] || 'png').replace('jpeg', 'jpg');
+                    url = `${acc.publicBase}/imessage/pub/${encodeURIComponent(inboxId)}/${acc.hookToken}/stk_${local.hash}.${ext}`;
+                }
+                await p.sendMedia(acc, url);
+                await keepChat();
+            },
             async sendVoice(mp3) {
                 const inboxId = await self.s.get('inbox');
                 const id = await self._putPublic(mp3, 'audio/mpeg', 'mp3');
@@ -198,7 +222,11 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
         await this.s.put('seen', seen.slice(-SEEN_CAP));
         await this.s.put('pending', pending);
         await this.s.put('lastUserAt', now());
-        await this.hooks.schedule(DEBOUNCE_MS);
+        // 連發合併：每來一條就往後推「停手時間」（App 可設），但從這批第一條算起有封頂
+        const waitMs = replyWaitMs(await this.s.get('cfg'), DEBOUNCE_MS);
+        let since = await this.s.get('pendingSince');
+        if (pending.length === added || !since) { since = now(); await this.s.put('pendingSince', since); }
+        await this.hooks.schedule(Math.max(500, Math.min(waitMs, since + replyWaitCapMs(waitMs) - now())));
         return { json: { ok: true } };
     }
 
@@ -217,7 +245,21 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
             return null;
         }
         await this.s.delete('pending');
+        await this.s.delete('pendingSince');
         const chan = this._chanFor(acc);
+        const pending = await this._toPending(raw, chan);
+        try {
+            if (pending.length) await this.replyRound(chan, pending);
+            this.lastError = null;
+        } catch (e) {
+            this.lastError = String(e?.message || e);
+            console.warn('[imessage] reply failed:', this.lastError);
+        }
+        return null;
+    }
+
+    // webhook 收下的原始訊息 → 這輪的用戶訊息（指令當場處理）
+    async _toPending(raw, chan) {
         const pending = [];
         for (const m of raw) {
             const text = String(m.text || '').trim();
@@ -230,14 +272,7 @@ export class ImessageBridgeCore extends ChannelBridgeCore {
             else if (text) pending.push({ type: 'text', text, ts: m.ts });
             for (const url of m.mediaUrls || []) pending.push(await this._fetchMedia(url, m.ts));
         }
-        try {
-            if (pending.length) await this.replyRound(chan, pending);
-            this.lastError = null;
-        } catch (e) {
-            this.lastError = String(e?.message || e);
-            console.warn('[imessage] reply failed:', this.lastError);
-        }
-        return null;
+        return pending;
     }
 
     async _fetchMedia(url, ts) {

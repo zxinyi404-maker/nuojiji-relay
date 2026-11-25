@@ -10,18 +10,32 @@
 //   inbox / cfg / pair:<u>:<c> / log / media:<id>（見各方法註解）
 
 import { synthesizeSpeech, cleanTtsText } from '../wechat/tts.js';
-import { replyToWechatParts, fitToBudget, partsToWindowText } from '../wechat/replyToWechat.js';
+import { replyToWechatParts, fitToBudget, partsToWindowText, withTranslation } from '../wechat/replyToWechat.js';
 import { runGeneration } from '../ai/aiCaller.js';
 import { renderTranscript } from '../proactive/tick.js';
 import { renderTimeTokens } from '../util/timeTokens.js';
 import { buildMemoryContext } from '../proactive/mcpContext.js';
 import { createProactiveStore, PROACTIVE_WINDOW_CAP } from '../store/proactiveStore.js';
+import { b64ToBytes } from '../wechat/ilinkClient.js';
 
 export const LOG_CAP = 500;                       // 手機很久沒開也只留這麼多輪（每輪含完整內容，不截斷）
 export const LOG_MAX_AGE_MS = 30 * 24 * 3600e3;   // 30 天沒被取走才丟
 export const MEDIA_MAX_BYTES = 1.5 * 1024 * 1024; // 單個收到的媒體超過就只記文字不存檔
 
 export const pairKey = (u, c) => `pair:${String(u)}:${String(c)}`;
+
+// 本機表情包圖片：內容雜湊（hex）；單張上限（base64 字元數，約 3MB 圖）
+const STICKER_HASH_RE = /^[a-f0-9]{16,64}$/;
+const STICKER_MAX_B64 = 4 * 1024 * 1024;
+
+// ⏳ 連發合併：用戶停手多久才回（App 可設，秒）；一直有新訊息時最多等這麼久就先回
+export const REPLY_WAIT_MAX_SEC = 300;
+export function replyWaitMs(cfg, defMs) {
+    const sec = Number(cfg?.replyWaitSec);
+    return Number.isFinite(sec) && sec > 0 ? Math.min(REPLY_WAIT_MAX_SEC, sec) * 1000 : defMs;
+}
+// 總等待封頂：至少 20 秒、或停手時間的 4 倍，不超過 10 分鐘
+export const replyWaitCapMs = (waitMs) => Math.min(600000, Math.max(20000, waitMs * 4));
 
 // 🛌 作息一致：角色此刻在睡覺 / 忙 → 先不回，等醒來 / 忙完再回（App 同步來的日程時段 + 提示詞段落，後端零話術）
 const AWAY_MIN_LEFT_MS = 5 * 60 * 1000;        // 剩不到 5 分鐘就結束的時段 → 直接回
@@ -97,7 +111,10 @@ export class ChannelBridgeCore {
             case `GET ${p}/log`: return this.getLog();
             case `POST ${p}/ack`: return this.ack(body?.ids);
             case `GET ${p}/media`: return this.getMedia(query?.id);
+            case `POST ${p}/stickers/have`: return this.stickersHave(body?.hashes);
+            case `POST ${p}/sticker`: return this.putSticker(body || {});
             case `POST ${p}/mirror`: return this.mirrorProactive(body || {});
+            case `POST ${p}/forward`: return this.forwardFromApp(body || {});
             case `POST ${p}/kick`: await this.hooks.schedule(0); return { json: { ok: true } };
             default: {
                 const r = await this.handleChannel(method, path, query, body);
@@ -135,9 +152,13 @@ export class ChannelBridgeCore {
                 .map((p) => ({ userId: String(p.userId), charId: String(p.charId), name: String(p.name || ''), userName: String(p.userName || '') }));
         }
         if (body.active) next.active = { userId: String(body.active.userId), charId: String(body.active.charId) };
-        for (const k of ['proactive', 'showName', 'followSchedule']) if (typeof body[k] === 'boolean') next[k] = body[k];
+        for (const k of ['proactive', 'showName', 'followSchedule', 'forwardApp']) if (typeof body[k] === 'boolean') next[k] = body[k];
         // 角色語音：'text' 以文字發 / 'audio' 合成音頻發（需該角色有雲端可用的 TTS）
         if (body.voiceMode === 'text' || body.voiceMode === 'audio') next.voiceMode = body.voiceMode;
+        // 回覆前等用戶停手幾秒（連發好幾條時才不會說一句就回）
+        if (Number.isFinite(Number(body.replyWaitSec)) && body.replyWaitSec !== null && body.replyWaitSec !== '') {
+            next.replyWaitSec = Math.min(REPLY_WAIT_MAX_SEC, Math.max(1, Number(body.replyWaitSec)));
+        }
         if (!next.pairs?.some((p) => sameChar(p, next.active))) {
             next.active = next.pairs?.[0] ? { userId: next.pairs[0].userId, charId: next.pairs[0].charId } : null;
         }
@@ -172,12 +193,63 @@ export class ChannelBridgeCore {
             awayBlocks: body.awayBlocks && typeof body.awayBlocks === 'object' ? body.awayBlocks : (prev.awayBlocks || null),
             updatedAt: now(),
         });
+        // 換掉 / 刪掉的本機表情圖順手清掉（只在這個角色有用過本機表情時才需要）
+        if (Object.values(prev.stickerUrls || {}).some((v) => String(v).startsWith('stk:'))) await this._gcStickers();
         return { json: { ok: true } };
     }
 
     async removePair({ userId, charId }) {
         await this.s.delete(pairKey(userId, charId));
+        await this._gcStickers();
         return { json: { ok: true } };
+    }
+
+    // ---------- 本機表情包圖片 ----------
+    // 用戶上傳到糯嘰機的表情沒有網址 → 手機把圖片傳上來，按內容雜湊存 stk:<hash>；
+    //   角色模板裡的 stickerUrls 對應寫成 "stk:<hash>"，發送時從這裡取圖
+    async stickersHave(hashes) {
+        const list = Array.isArray(hashes) ? hashes.map(String).filter((h) => STICKER_HASH_RE.test(h)) : [];
+        const missing = [];
+        for (const h of list) if (!(await this.s.get(`stk:${h}`))) missing.push(h);
+        return { json: { ok: true, missing } };
+    }
+
+    async putSticker({ hash, mime, b64 }) {
+        if (!STICKER_HASH_RE.test(String(hash || '')) || typeof b64 !== 'string' || !b64) return { status: 400, json: { error: 'hash / b64 required' } };
+        if (b64.length > STICKER_MAX_B64) return { status: 413, json: { error: 'sticker too large' } };
+        await this.s.put(`stk:${hash}`, { mime: /^image\//.test(mime || '') ? mime : 'image/png', b64, at: now() });
+        const idx = (await this.s.get('stkIdx')) || [];
+        if (!idx.includes(hash)) { idx.push(hash); await this.s.put('stkIdx', idx); }
+        return { json: { ok: true } };
+    }
+
+    /** "stk:<hash>" → { mime, bytes }；不是本機表情 → null */
+    async loadSticker(ref) {
+        const m = /^stk:([a-f0-9]+)$/.exec(String(ref || ''));
+        if (!m) return null;
+        const rec = await this.s.get(`stk:${m[1]}`);
+        return rec ? { mime: rec.mime, bytes: b64ToBytes(rec.b64), hash: m[1] } : null;
+    }
+
+    // 沒有任何角色再用到的表情圖刪掉
+    async _gcStickers() {
+        const idx = (await this.s.get('stkIdx')) || [];
+        if (!idx.length) return;
+        const cfg = (await this.s.get('cfg')) || {};
+        const used = new Set();
+        for (const p of cfg.pairs || []) {
+            const rec = await this.s.get(pairKey(p.userId, p.charId));
+            for (const v of Object.values(rec?.stickerUrls || {})) {
+                const m = /^stk:([a-f0-9]+)$/.exec(String(v));
+                if (m) used.add(m[1]);
+            }
+        }
+        const keep = [];
+        for (const h of idx) {
+            if (used.has(h)) keep.push(h);
+            else await this.s.delete(`stk:${h}`);
+        }
+        if (keep.length !== idx.length) await this.s.put('stkIdx', keep);
     }
 
     // ---------- 手機取對話 ----------
@@ -288,41 +360,47 @@ export class ChannelBridgeCore {
             }
         }
 
-        const userWindowMsgs = pending.map((m) => ({
-            sender: 'me',
-            text: m.type === 'voice' ? `[voice] ${m.text}` : m.type === 'image' ? '[image]' : m.type === 'file' ? `[file: ${m.fileName}]` : m.text,
-            timestamp: m.ts,
-        }));
-        const window = [...(rec.recentMessages || []), ...userWindowMsgs].slice(-PROACTIVE_WINDOW_CAP);
-        const transcript = renderTranscript(window, rec.timeSpec);
-        let memory = '';
-        try { memory = await buildMemoryContext(rec.mcpContextServers, window, { userId: rec.userId, characterId: rec.charId }); } catch { /* 無記憶 MCP */ }
-        let system = fillTemplate(renderTimeTokens(rec.promptTemplate, rec.timeSpec, now(), rec.lastInteractionAt || 0), { transcript, memory });
-        // 🛌 延後的這輪：追加 App 給的「剛醒 / 剛忙完才看到」段落
-        const awayBlock = deferred && rec.awayBlocks?.[deferred.level];
-        if (awayBlock) system += `\n\n${String(awayBlock).replaceAll('{title}', deferred.title || '')}`;
-        const images = pending.filter((m) => m.dataUrl).map((m) => ({ type: 'image_url', image_url: { url: m.dataUrl } }));
-        const userTurn = images.length
-            ? [{ type: 'text', text: '请开始回复。（用户这轮发来的图片附在下面）' }, ...images]
-            : '请开始回复。';
+        // 生成完、發出去之前用戶又發了 → 併進來重新生成一次（像真人看到新訊息會一起回），最多重來 2 次
+        let window, content = null, reasoning = null, error = null;
+        for (let attempt = 0; ; attempt++) {
+            const userWindowMsgs = pending.map((m) => ({
+                sender: 'me',
+                text: m.type === 'voice' ? `[voice] ${m.text}` : m.type === 'image' ? '[image]' : m.type === 'file' ? `[file: ${m.fileName}]` : m.text,
+                timestamp: m.ts,
+            }));
+            window = [...(rec.recentMessages || []), ...userWindowMsgs].slice(-PROACTIVE_WINDOW_CAP);
+            const transcript = renderTranscript(window, rec.timeSpec);
+            let memory = '';
+            try { memory = await buildMemoryContext(rec.mcpContextServers, window, { userId: rec.userId, characterId: rec.charId }); } catch { /* 無記憶 MCP */ }
+            let system = fillTemplate(renderTimeTokens(rec.promptTemplate, rec.timeSpec, now(), rec.lastInteractionAt || 0), { transcript, memory });
+            // 🛌 延後的這輪：追加 App 給的「剛醒 / 剛忙完才看到」段落
+            const awayBlock = deferred && rec.awayBlocks?.[deferred.level];
+            if (awayBlock) system += `\n\n${String(awayBlock).replaceAll('{title}', deferred.title || '')}`;
+            const images = pending.filter((m) => m.dataUrl).map((m) => ({ type: 'image_url', image_url: { url: m.dataUrl } }));
+            const userTurn = images.length
+                ? [{ type: 'text', text: '请开始回复。（用户这轮发来的图片附在下面）' }, ...images]
+                : '请开始回复。';
 
-        await chan.typing?.(true);
-        let content = null, reasoning = null, error = null;
-        try {
+            await chan.typing?.(true);
+            content = null; reasoning = null; error = null;
             try {
-                ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: userTurn }], rec.aiSettings?.maxTokens || null));
+                try {
+                    ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: userTurn }], rec.aiSettings?.maxTokens || null));
+                } catch (e) {
+                    // 模型不支援看圖 → 拿掉圖片再試一次
+                    if (!images.length) throw e;
+                    ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: '请开始回复。' }], rec.aiSettings?.maxTokens || null));
+                }
             } catch (e) {
-                // 模型不支援看圖 → 拿掉圖片再試一次
-                if (!images.length) throw e;
-                ({ content, reasoning } = await runGeneration(rec.aiSettings, [{ role: 'system', content: system }, { role: 'user', content: '请开始回复。' }], rec.aiSettings?.maxTokens || null));
+                error = String(e?.message || e);
             }
-        } catch (e) {
-            error = String(e?.message || e);
-        } finally {
-            await chan.typing?.(false);
+            const more = !error && attempt < 2 ? ((await chan.takeNew?.().catch(() => null)) || []) : [];
+            if (!more.length) { await chan.typing?.(false); break; }
+            pending = [...pending, ...more];
         }
+        const logUserMsgsAll = pending.map(({ dataUrl, ...rest }) => rest);
 
-        const entry = { ...entryBase, userId: rec.userId, charId: rec.charId, userMessages: logUserMsgs, content, reasoning: reasoning || null, error };
+        const entry = { ...entryBase, userId: rec.userId, charId: rec.charId, userMessages: logUserMsgsAll, content, reasoning: reasoning || null, error };
         if (error) {
             await this._appendLog(entry);
             await chan.sendText(`（${rec.name || '角色'}这次没能回复：${error}）`).catch(() => {});
@@ -340,9 +418,19 @@ export class ChannelBridgeCore {
 
     // 角色回覆拆成一條條訊息發出；回傳實際發出的部分
     async deliver(chan, rec, content, { isActive, cfg }) {
+        const parts = replyToWechatParts(content, { stickerUrls: rec.stickerUrls || {}, allowState: !!rec.allowState });
+        return this.sendParts(chan, rec, parts, { isActive, cfg });
+    }
+
+    // 已拆好的一條條（text / sticker / voice）發出去：語音能不能發、名字前綴、額度裁剪都在這裡
+    async sendParts(chan, rec, rawParts, { isActive, cfg, prefix = [] }) {
         const audioVoice = cfg.voiceMode !== 'text' && !!rec.ttsSpec && typeof chan.sendVoice === 'function';
-        let parts = replyToWechatParts(content, { stickerUrls: rec.stickerUrls || {}, allowState: !!rec.allowState })
-            .map((p) => (p.kind === 'voice' && !audioVoice ? { ...p, kind: 'text', text: `[语音] ${p.text}` } : p));
+        // 語音：能發音頻 → 音頻（原文）+ 有翻譯再跟一條翻譯文字；發不了 → 「[语音] 原文」+ 翻譯
+        let parts = rawParts.flatMap((p) => {
+            if (p.kind !== 'voice') return [p];
+            if (!audioVoice) return [{ ...p, kind: 'text', text: withTranslation(`[语音] ${p.text}`, p.tr), windowText: `[voice] ${p.text}` }];
+            return p.tr ? [p, { kind: 'text', text: p.tr, noWindow: true }] : [p];
+        });
         if (!parts.length) return [];
         // 多個角色共用一個帳號：頭像只有一個 → 回覆前帶名字分辨是誰
         const multi = (cfg.pairs || []).length > 1;
@@ -353,6 +441,8 @@ export class ChannelBridgeCore {
             if (parts[0].kind === 'text') parts[0] = { ...parts[0], text: `${tag}${parts[0].text}` };
             else parts.unshift({ kind: 'text', text: tag });
         }
+        // 前置段（例：App 裡用戶說的那句引用）放最前面，不帶名字
+        parts = [...prefix, ...parts];
         if (Number.isFinite(chan.budget)) parts = fitToBudget(parts, chan.budget);
         const sent = [];
         for (let i = 0; i < parts.length; i++) {
@@ -398,7 +488,7 @@ export class ChannelBridgeCore {
             const inboxId = await this.s.get('inbox');
             if (inboxId) {
                 const proactive = await createProactiveStore(this.env);
-                await proactive.patch(inboxId, rec.userId, rec.charId, { recentMessages: window, lastInteractionAt: t });
+                await proactive.patch(inboxId, rec.userId, rec.charId, { recentMessages: window, lastInteractionAt: t, bridgeInteractionAt: t });
             }
         } catch (e) { console.warn(`[${this.opts.logPrefix}] proactive window patch failed:`, e?.message); }
     }
@@ -418,5 +508,44 @@ export class ChannelBridgeCore {
             await this.s.put(pairKey(userId, charId), { ...rec, recentMessages: [...(rec.recentMessages || []), ...charWindowMsgs].slice(-PROACTIVE_WINDOW_CAP), lastInteractionAt: now() });
         }
         return { json: { ok: true, sent: sent.length } };
+    }
+
+    // ---------- 糯嘰機 App 裡聊的 → 也發到這個渠道 ----------
+    // body: { userId, charId, messages:[{ sender:'me'|'char', type:'text'|'sticker'|'voice'|'image', text, url?, meaning? }] }
+    //   角色那幾條照常發；用戶在 App 說的話合成一條引用放最前面（外部聊天軟體裡只有 Bot 能說話）
+    async forwardFromApp({ userId, charId, messages }) {
+        const cfg = (await this.s.get('cfg')) || {};
+        if (cfg.forwardApp === false) return { json: { ok: false, reason: 'off' } };
+        if (!(cfg.pairs || []).some((p) => sameChar(p, { userId, charId }))) return { json: { ok: false, reason: 'not linked' } };
+        const rec = await this.s.get(pairKey(userId, charId));
+        if (!rec) return { json: { ok: false, reason: 'pair not ready' } };
+        const list = Array.isArray(messages) ? messages : [];
+        const mine = list.filter((m) => m?.sender === 'me').map((m) => (m.type === 'image' ? '[图片]' : m.type === 'voice' ? `[语音] ${m.text || ''}` : String(m.text || ''))).filter((x) => x.trim());
+        const charParts = [];
+        for (const m of list) {
+            if (m?.sender !== 'char') continue;
+            if (m.type === 'sticker' && /^https?:\/\//i.test(m.url || '')) charParts.push({ kind: 'sticker', url: m.url, meaning: m.meaning || m.text || '' });
+            else if (m.type === 'sticker') {
+                // 本機表情（App 那邊沒網址）→ 按含義找這個角色傳上來的同一張
+                const meaning = m.meaning || m.text || '';
+                const ref = meaning && rec.stickerUrls?.[meaning];
+                charParts.push(ref ? { kind: 'sticker', url: ref, meaning } : { kind: 'text', text: `[表情] ${meaning}` });
+            }
+            else if (m.type === 'voice' && m.text) charParts.push({ kind: 'voice', text: String(m.text), ...(m.tr ? { tr: String(m.tr) } : {}) });
+            else if (m.type === 'image' && /^https?:\/\//i.test(m.url || '')) charParts.push({ kind: 'sticker', url: m.url, meaning: m.text || '图片' });
+            else if (m.type === 'image') charParts.push({ kind: 'text', text: `[图片] ${m.text || ''}`.trim() });
+            else if (String(m.text || '').trim()) charParts.push({ kind: 'text', text: String(m.text) });
+        }
+        if (!charParts.length && !mine.length) return { json: { ok: true, sent: 0 } };
+        const opened = await this.openChannel({ proactive: true });
+        if (!opened?.chan) {
+            const reason = opened?.reason || 'channel closed';
+            const why = { 'window closed': `超过 24 小时没在${this.opts.label}里说话`, 'quota used': `这轮 10 条回复额度用完了` }[reason] || reason;
+            this.lastWarn = { at: now(), text: `糯叽机里的聊天没能发到${this.opts.label}：${why}，在${this.opts.label}里给 Bot 发一句就恢复。` };
+            return { json: { ok: false, reason } };
+        }
+        const prefix = mine.length ? [{ kind: 'text', text: `（你在糯叽机说）${mine.join('\n')}` }] : [];
+        const sent = await this.sendParts(opened.chan, rec, charParts, { isActive: sameChar(cfg.active, { userId, charId }), cfg, prefix });
+        return { json: { ok: true, sent: sent.length, total: charParts.length + prefix.length } };
     }
 }

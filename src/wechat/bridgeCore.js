@@ -13,13 +13,12 @@
 import {
     ILINK_BASE, REPLY_QUOTA, ItemType, IlinkError,
     fetchLoginQr, pollLoginStatus, getUpdates, notifyStart, notifyStop,
-    sendText, sendImage, sendFile, getTypingTicket, sendTyping, downloadMedia, bytesToB64,
+    sendItem, sendText, sendImage, sendFile, getTypingTicket, sendTyping, downloadMedia, bytesToB64,
 } from './ilinkClient.js';
-import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now } from '../chatbridge/baseCore.js';
+import { ChannelBridgeCore, MEDIA_MAX_BYTES, sniffMime, newMediaId, now, replyWaitMs, replyWaitCapMs } from '../chatbridge/baseCore.js';
 
 const SEEN_CAP = 200;
-const DEBOUNCE_POLL_MS = 3500;             // 用戶連發：停手這麼久才開始回
-const DEBOUNCE_MAX_MS = 20000;
+const DEBOUNCE_POLL_MS = 5000;             // 用戶連發：停手這麼久才開始回（預設；App 可改。微信轉給 Bot 本身就慢一兩秒，3.5 秒太趕）
 // context_token 的有效期：第三方 SDK 記錄為 24 小時，留一點餘量
 const CTX_TTL_MS = 23.5 * 3600e3;
 const LOGIN_QR_TTL_MS = 5 * 60e3;
@@ -115,7 +114,19 @@ export class WechatBridgeCore extends ChannelBridgeCore {
         return {
             budget: REPLY_QUOTA - (ctx.sent || 0),
             sendText: (text) => sendText(bind, ctx.peer, ctx.token, text),
+            // 生成期間用戶又發的訊息（排在伺服器上等著）→ 收下來，交給核心併進這輪重新生成
+            async takeNew() {
+                const cursor = (await self.s.get('cursor')) || '';
+                const resp = await getUpdates(bind, cursor, { timeoutMs: 1500 });
+                if (resp.get_updates_buf && resp.get_updates_buf !== cursor) await self.s.put('cursor', resp.get_updates_buf);
+                const more = [];
+                await self._collect(bind, resp.msgs || [], more);
+                return more;
+            },
             async sendSticker(url) {
+                // 本機表情（手機傳上來存在中繼的）
+                const local = await self.loadSticker(url);
+                if (local) { await sendImage(bind, ctx.peer, ctx.token, local.bytes); return; }
                 const res = await fetch(url);
                 if (!res.ok) throw new Error(`sticker HTTP ${res.status}`);
                 await sendImage(bind, ctx.peer, ctx.token, new Uint8Array(await res.arrayBuffer()));
@@ -173,16 +184,23 @@ export class WechatBridgeCore extends ChannelBridgeCore {
             const pending = [];
             await this._collect(bind, batch, pending);
             // 連發合併：還有新訊息就再等一下，直到用戶停手（或封頂）
+            //   停手多久：App 可設（replyWaitSec），預設 5 秒；長輪詢單次最多 35 秒，所以按剩餘時間分段等
+            const waitMs = replyWaitMs(await this.s.get('cfg'), DEBOUNCE_POLL_MS);
+            const capMs = replyWaitCapMs(waitMs);
             const startedAt = now();
-            while (pending.length && now() - startedAt < DEBOUNCE_MAX_MS) {
-                resp = await getUpdates(bind, cursor, { timeoutMs: DEBOUNCE_POLL_MS });
+            let lastMsgAt = now();
+            while (pending.length && now() - startedAt < capMs) {
+                const remain = Math.min(waitMs - (now() - lastMsgAt), capMs - (now() - startedAt));
+                if (remain <= 0) break;
+                resp = await getUpdates(bind, cursor, { timeoutMs: Math.min(remain, 35000) });
                 batch = resp.msgs || [];
                 if (resp.get_updates_buf && resp.get_updates_buf !== cursor) {
                     cursor = resp.get_updates_buf;
                     await this.s.put('cursor', cursor);
                 }
-                if (!batch.length) break;
+                if (!batch.length) continue;
                 await this._collect(bind, batch, pending);
+                lastMsgAt = now();
             }
             if (pending.length) {
                 const ctx = await this.s.get('ctx');
@@ -205,6 +223,27 @@ export class WechatBridgeCore extends ChannelBridgeCore {
         }
     }
 
+    // 🧪 試微信原生引用：官方插件只「收」引用、從不「發」，介面欄位 ref_msg 是同一個結構但沒文件。
+    //   用戶在微信發「/引用测试」→ 用他上一句話發三種寫法，看哪條在微信裡出現引用框。
+    async _quoteProbe(bind, ctx) {
+        const last = await this.s.get('lastUserText');
+        const send = (item) => sendItem(bind, ctx.peer, ctx.token, item).catch((e) => console.warn('[wechat] quote probe:', e?.message));
+        if (!last?.text) {
+            await send({ type: ItemType.TEXT, text_item: { text: '先随便发一句话，再发「/引用测试」。' } });
+            await this._bumpSent(1);
+            return;
+        }
+        const quoted = { type: ItemType.TEXT, text_item: { text: last.text }, create_time_ms: last.ts };
+        const variants = [
+            ['A', { title: last.text, message_item: quoted }],
+            ['B', { svr_id: last.svrId, message_item: { ...quoted, msg_id: last.msgId } }],
+            ['C', { title: last.text, svr_id: last.svrId, message_item: { ...quoted, msg_id: last.msgId } }],
+        ];
+        await send({ type: ItemType.TEXT, text_item: { text: `引用测试：下面三条都想引用你刚才那句「${last.text}」。看看哪条带着微信自己的引用框，记下字母。` } });
+        for (const [name, ref] of variants) await send({ type: ItemType.TEXT, text_item: { text: `测试 ${name}` }, ref_msg: ref });
+        await this._bumpSent(1 + variants.length);
+    }
+
     // 把一批原始訊息整理成「這輪用戶說了什麼」；指令當場處理
     async _collect(bind, msgs, pending) {
         if (!msgs.length) return;
@@ -222,10 +261,14 @@ export class WechatBridgeCore extends ChannelBridgeCore {
             const firstText = items.find((it) => it.type === ItemType.TEXT)?.text_item?.text?.trim() || '';
             if (items.length === 1 && /^[/／]/.test(firstText)) {
                 const chan = this._chanFor(bind, ctx);
+                if (/^[/／]\s*引用测试/.test(firstText)) { await this._quoteProbe(bind, ctx); continue; }
                 await this.runCommand(firstText.replace(/^[/／]\s*/, ''), (text) => chan.sendText(text).then(() => this._bumpSent(1)).catch(() => {}));
                 continue;
             }
             const ts = Number(m.create_time_ms) || now();
+            // 記下最近一條文字（/引用测试 用：試 Bot 能不能用微信原生引用框）
+            const textItem = items.find((it) => it.type === ItemType.TEXT);
+            if (firstText && textItem) await this.s.put('lastUserText', { text: firstText, svrId: String(m.message_id || ''), msgId: String(textItem.msg_id || ''), ts });
             for (const it of items) {
                 const um = await this._toUserMessage(it, ts);
                 if (um) pending.push(um);
