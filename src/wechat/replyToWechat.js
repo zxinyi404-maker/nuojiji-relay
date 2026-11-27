@@ -17,6 +17,39 @@ const DESC = {
     pat: '拍一拍', video_call: '视频通话',
 };
 
+// 類型別名（對齊 App messageTagParser 的歸一表）：模型寫成 "Text" / "photo" / "narration" 之類，
+// App 照樣顯示，中繼若認不得就整條靜默丟掉 → App 裡看得到回覆、微信一條都收不到
+const TYPE_ALIAS = {
+    msg: 'text', message: 'text', txt: 'text', chat: 'text', say: 'text', speech: 'text', dialogue: 'text', dialog: 'text', line: 'text',
+    simimg: 'image', sim_img: 'image', sim_image: 'image', simg: 'image', simulated_image: 'image', selfie: 'image', photo: 'image', picture: 'image', pic: 'image',
+    clip: 'video', video_clip: 'video', vid: 'video',
+    sticker_message: 'sticker', stickermsg: 'sticker', emoji_sticker: 'sticker',
+    narration: 'state', narrative: 'state', action: 'state', act: 'state', scene: 'state',
+    描述: 'state', 旁白: 'state', 动描: 'state', 動描: 'state', 动作: 'state', 動作: 'state', 动作描写: 'state', 動作描寫: 'state',
+    htm: 'html', raw_html: 'html', rawhtml: 'html',
+    videocallopening: 'video_call', video_call_opening: 'video_call', videocall_opening: 'video_call',
+    think: 'thinking', thought: 'thinking', thoughts: 'thinking', reasoning: 'thinking', reason: 'thinking', 思考: 'thinking', 思維: 'thinking', 思维: 'thinking',
+    calendar: 'cal', calender: 'cal', 日曆: 'cal', 日历: 'cal',
+};
+export function normalizeType(t) {
+    const n = String(t || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    return TYPE_ALIAS[n] || n;
+}
+// 不外發的類型（隱藏 / App 內部動作 / 卡片操作）；不在這裡、也不在上面認得的可見類型 → 像 App 一樣當文字發
+const HIDDEN_TYPES = new Set([
+    'thinking', 'react', 'memory', 'cal_update', 'cal', 'health', 'xinsheng', 'note', 'reply_note', 'npc_trigger', 'npc_msg', 'dm_from',
+    'group_msg', 'pair_msg', 'theater', 'auto_reply', 'commitment', 'plan', 'recall', 'reject_transfer', 'accept_transfer',
+    'spend', 'ledger', 'shop_ask', 'lifeup', 'image_edit', 'post_moment', 'post_forum', 'comment_moment', 'reply_comment', 'like_moment',
+    'bond_card', 'bond_design', 'bond_task', 'bond_pact', 'bond_grand', 'tempo', 'meta', 'plan_line', 'mood', 'status',
+]);
+const stripHtml = (h) => String(h || '')
+    .replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>|<\/(?:p|div|li|h\d)>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
 function pickStr(...vals) {
     for (const v of vals) if (typeof v === 'string' && v.trim()) return v.trim();
     return '';
@@ -46,10 +79,11 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
     let sawJson = false;
     const plain = [];
     for (const tk of tokens) {
-        if (tk.text != null) { plain.push(tk.text); continue; }
+        // 裸文字按出現位置佔位（以前一律排到最後 → 狀態欄 / 卡片跑到整輪末尾）
+        if (tk.text != null) { plain.push(tk.text); parts.push({ kind: 'text', text: tk.text, _plain: true }); continue; }
         const obj = tk.obj;
         sawJson = true;
-        const t = obj.t;
+        const t = normalizeType(obj.t ?? obj.type);
         if (t === 'text') {
             const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text, obj.content));
             // 滑窗只記原文（App 送 AI 的窗口也只有原文）
@@ -85,6 +119,14 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
             const extra = pickStr(obj.c, obj.note, obj.name, obj.d, obj.title);
             parts.push({ kind: 'text', text: `[${DESC[t]}]${extra ? ` ${extra}` : ''}` });
         }
+        else if (t === 'html') {
+            const c = stripHtml(pickStr(obj.c, obj.html, obj.content));
+            if (c) parts.push({ kind: 'text', text: c });
+        } else if (t && !HIDDEN_TYPES.has(t)) {
+            // App 的未知類型會當文字顯示 → 這裡也照發，免得 App 裡有、微信裡沒有
+            const { orig: c, tr } = splitTranslation(obj, pickStr(obj.c, obj.text, obj.content));
+            if (c) parts.push({ kind: 'text', text: withTranslation(c, tr), ...(tr ? { windowText: c } : {}) });
+        }
         // 其他（隱藏/動作類）不發
     }
     if (!sawJson) {
@@ -94,8 +136,9 @@ export function replyToWechatParts(content, { stickerUrls = {}, allowState = fal
         return [{ kind: 'text', text: withTranslation(orig, tr), ...(tr ? { windowText: orig } : {}) }];
     }
     // JSON 輪次裡夾著的裸文字行也照發（AI 偶爾漏包 JSON）；開場白（「我會以角色身份回覆…」）不發
-    for (const p of plain) if (!/^[{}[\]]+$/.test(p) && !isMetaChatter(p)) parts.push({ kind: 'text', text: p });
-    return parts;
+    return parts
+        .filter((p) => !p._plain || (!/^[{}[\]]+$/.test(p.text) && !isMetaChatter(p.text)))
+        .map(({ _plain, ...p }) => p);
 }
 
 // ---------- 容錯切分（對齊 App messageTagParser 的 mergeIncompleteJsonLines / parseJsonLine） ----------
@@ -147,6 +190,16 @@ export function tokenizeReply(content) {
     let i = 0;
     let afterObj = false;
     while (i < src.length) {
+        // 物件之間的整塊內容（```html 圍欄 / [HTML] 卡片 / 跨行的 <tag>…</tag>）：整塊當一條，
+        // 不逐行拆（逐行拆會讓 CSS / 標籤碎片一行行發出去，用戶的顯示正則也配不上）
+        const blk = findBlock(src, i);
+        if (blk) {
+            pushText(src.slice(i, blk.start));
+            out.push({ text: blk.text });
+            i = blk.end;
+            afterObj = false;
+            continue;
+        }
         // 找下一個「行首」的 {（行內的 { 是文字的一部分）；緊接在上一個物件後面的也算（一行塞了兩個）
         const isStart = (k) => (afterObj && /^\s*$/.test(src.slice(i, k)))
             || src.slice(src.lastIndexOf('\n', k - 1) + 1, k).replace(/^\s*(?:```\w*)?\s*/, '') === '';
@@ -175,6 +228,62 @@ export function tokenizeReply(content) {
         i = end + 1;
     }
     return out;
+}
+
+// 從 i 起、下一個 JSON 物件之前，有沒有「整塊」內容；有就回 { start, end, text }
+const NEXT_OBJ_RE = /^[ \t]*\{/m;
+const BLOCK_OPEN_RE = /^[ \t]*(?:```(?:html|HTML)[ \t]*$|\[HTML\]|<([A-Za-z一-鿿][\w一-鿿-]*)(?:\s[^<>\n]*)?>)/m;
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function findBlock(src, i) {
+    const rest = src.slice(i);
+    const objAt = rest.search(NEXT_OBJ_RE);
+    const re = new RegExp(BLOCK_OPEN_RE.source, 'gm');
+    let mo;
+    while ((mo = re.exec(rest))) {
+        if (objAt !== -1 && objAt < mo.index) return null; // 先遇到 JSON 物件 → 交給物件那邊
+        const blk = blockAt(src, i + mo.index, mo);
+        if (blk) return blk;
+        if (mo[0].length === 0) re.lastIndex++;
+    }
+    return null;
+}
+function blockAt(src, start, mo) {
+    const head = mo[0].trim();
+    let end;
+    let text;
+    if (head.startsWith('```')) {
+        // ```html 圍欄 → 到下一個 ``` 行
+        const close = /^[ \t]*```[ \t]*$/m;
+        const after = src.slice(start + mo[0].length);
+        const mc = close.exec(after);
+        if (!mc) return null;
+        end = start + mo[0].length + mc.index + mc[0].length;
+        // CSS 起頭（AI 常漏 <style> 包裹）→ 第一個標籤之前的 CSS 補上 <style>，轉文字時整段丟掉（App 同款判定）
+        let body = after.slice(0, mc.index).trim();
+        if (body && !body.startsWith('<') && /^(?:[:.#*@]|\/\*|[a-z-]+\s*\{)/i.test(body)) {
+            const k = body.indexOf('<');
+            body = k === -1 ? `<style>${body}</style>` : `<style>${body.slice(0, k)}</style>${body.slice(k)}`;
+        }
+        text = `[HTML]${body}`;
+    } else if (head.startsWith('[HTML]')) {
+        // 裸 [HTML] 卡片 → 到下一個 JSON 物件行或結尾
+        const fromHere = src.slice(start);
+        const nextObj = fromHere.slice(1).search(NEXT_OBJ_RE);
+        end = nextObj === -1 ? src.length : start + 1 + nextObj;
+        text = src.slice(start, end).trim();
+    } else {
+        // 行首的 <tag>：同一行就閉合的不算整塊（照常逐行）；跨行的找 </tag>
+        const tag = mo[1];
+        const lineEnd = src.indexOf('\n', start);
+        const firstLine = src.slice(start, lineEnd === -1 ? src.length : lineEnd);
+        const closeRe = new RegExp(`</${escRe(tag)}\\s*>`, 'i');
+        if (closeRe.test(firstLine) || lineEnd === -1) return null;
+        const mc = closeRe.exec(src.slice(lineEnd));
+        if (!mc) return null;
+        end = lineEnd + mc.index + mc[0].length;
+        text = src.slice(start, end).trim();
+    }
+    return { start, end, text };
 }
 
 // 模型的開場白 / 自我說明（不是角色台詞）：只在這輪有 JSON 時才丟
